@@ -1,0 +1,109 @@
+# ============================================================
+#  Project-level exclusions
+# ============================================================
+
+# Markdown files at root (project notes, not for the repo)
+/CLAUDE.md
+/situation.md
+/scripts_documentation.md
+/scripts_modifiied.md
+
+# Thesis (kept local only)
+/Thesis/
+
+# Claude Code agent and skill configs
+/.claude/
+/.agents/
+/skills-lock.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# ============================================================
+#  Unity (tfgadria/)
+# ============================================================
+
+# Auto-generated build / cache folders
+tfgadria/[Ll]ibrary/
+tfgadria/[Tt]emp/
+tfgadria/[Oo]bj/
+tfgadria/[Bb]uild/
+tfgadria/[Bb]uilds/
+tfgadria/[Ll]ogs/
+tfgadria/[Uu]ser[Ss]ettings/
+tfgadria/[Mm]emoryCaptures/
+tfgadria/[Rr]ecordings/
+
+# Old / superseded log folder
+tfgadria/LogData/
+
+# Decorative assets not used by the build
+tfgadria/deco/
+
+# Auto-generated Visual Studio / Rider files
+tfgadria/*.csproj
+tfgadria/*.sln
+tfgadria/*.slnx
+tfgadria/*.suo
+tfgadria/*.user
+tfgadria/*.userprefs
+tfgadria/*.unityproj
+tfgadria/*.vsconfig
+tfgadria/*.pidb
+tfgadria/*.booproj
+tfgadria/*.svd
+tfgadria/.vs/
+tfgadria/ExportedObj/
+tfgadria/.consulo/
+tfgadria/*.tmp
+tfgadria/*.apk
+tfgadria/*.aab
+tfgadria/*.unitypackage
+tfgadria/*.app
+
+# Unity crash reports
+tfgadria/sysinfo.txt
+tfgadria/crashlytics-build.properties
+
+# Asset meta files for ignored folders shouldn't leak
+tfgadria/Assets/AssetStoreTools*
+
+# ============================================================
+#  Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ============================================================
+#  LaTeX (just in case any aux files end up at root)
+# ============================================================
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
