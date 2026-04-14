@@ -10,7 +10,7 @@ A Virtual Reality environment built in Unity 6, integrated with an OptiTrack 6-c
 
 ```
 .
-├── tfgadria/                  Unity 6 project
+├── unityproject/                  Unity 6 project
 │   ├── Assets/
 │   │   ├── Models/            Y Bot rigged mesh (Mixamo)
 │   │   ├── Scripts/           C# scripts (XR logging, UDP receiver, calibration, arm controller)
@@ -39,7 +39,7 @@ A Virtual Reality environment built in Unity 6, integrated with an OptiTrack 6-c
 
 ### Running the tracking pipeline
 1. On the OptiTrack PC, run `python PythonClient/PythonSample.py` (or `PythonSample2.py` for cleaner output).
-2. Open `tfgadria/` in Unity and press Play.
+2. Open `unityproject/` in Unity and press Play.
 3. Place 4 markers on the table corners and press **C** to calibrate.
 4. Place 3 markers on the arm (shoulder, elbow, hand) and press **O** to activate the virtual arm.
 

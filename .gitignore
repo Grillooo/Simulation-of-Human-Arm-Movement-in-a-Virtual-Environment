@@ -28,53 +28,53 @@ desktop.ini
 *~
 
 # ============================================================
-#  Unity (tfgadria/)
+#  Unity (unityproject/)
 # ============================================================
 
 # Auto-generated build / cache folders
-tfgadria/[Ll]ibrary/
-tfgadria/[Tt]emp/
-tfgadria/[Oo]bj/
-tfgadria/[Bb]uild/
-tfgadria/[Bb]uilds/
-tfgadria/[Ll]ogs/
-tfgadria/[Uu]ser[Ss]ettings/
-tfgadria/[Mm]emoryCaptures/
-tfgadria/[Rr]ecordings/
+unityproject/[Ll]ibrary/
+unityproject/[Tt]emp/
+unityproject/[Oo]bj/
+unityproject/[Bb]uild/
+unityproject/[Bb]uilds/
+unityproject/[Ll]ogs/
+unityproject/[Uu]ser[Ss]ettings/
+unityproject/[Mm]emoryCaptures/
+unityproject/[Rr]ecordings/
 
 # Old / superseded log folder
-tfgadria/LogData/
+unityproject/LogData/
 
 # Decorative assets not used by the build
-tfgadria/deco/
+unityproject/deco/
 
 # Auto-generated Visual Studio / Rider files
-tfgadria/*.csproj
-tfgadria/*.sln
-tfgadria/*.slnx
-tfgadria/*.suo
-tfgadria/*.user
-tfgadria/*.userprefs
-tfgadria/*.unityproj
-tfgadria/*.vsconfig
-tfgadria/*.pidb
-tfgadria/*.booproj
-tfgadria/*.svd
-tfgadria/.vs/
-tfgadria/ExportedObj/
-tfgadria/.consulo/
-tfgadria/*.tmp
-tfgadria/*.apk
-tfgadria/*.aab
-tfgadria/*.unitypackage
-tfgadria/*.app
+unityproject/*.csproj
+unityproject/*.sln
+unityproject/*.slnx
+unityproject/*.suo
+unityproject/*.user
+unityproject/*.userprefs
+unityproject/*.unityproj
+unityproject/*.vsconfig
+unityproject/*.pidb
+unityproject/*.booproj
+unityproject/*.svd
+unityproject/.vs/
+unityproject/ExportedObj/
+unityproject/.consulo/
+unityproject/*.tmp
+unityproject/*.apk
+unityproject/*.aab
+unityproject/*.unitypackage
+unityproject/*.app
 
 # Unity crash reports
-tfgadria/sysinfo.txt
-tfgadria/crashlytics-build.properties
+unityproject/sysinfo.txt
+unityproject/crashlytics-build.properties
 
 # Asset meta files for ignored folders shouldn't leak
-tfgadria/Assets/AssetStoreTools*
+unityproject/Assets/AssetStoreTools*
 
 # ============================================================
 #  Python
