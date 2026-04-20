@@ -21,9 +21,8 @@ public class ArmModelController : MonoBehaviour
     [Header("Arm Model")]
     [Tooltip("Drag the Y Bot FBX (or any Mixamo humanoid) here. Leave empty for primitive fallback.")]
     public GameObject armModelPrefab;
-
-    [Header("Skin")]
-    public Color skinColor = new Color(0.87f, 0.75f, 0.65f);
+    [Tooltip("Scale of the arm model (reduce if arm appears too large)")]
+    public float modelScale = 0.85f;
 
     [Header("Fallback Primitives")]
     public float armRadius = 0.04f;
@@ -57,6 +56,8 @@ public class ArmModelController : MonoBehaviour
     private Vector3[] _jointSmoothed = new Vector3[3];
     private float[]   _jointLastSeen = new float[3];
     private bool  _initialized;
+    private bool  _markersLost;
+    private float _lostSince;
     private float _allLostTimer;
     private List<Vector3> _markerPositions = new List<Vector3>();
 
@@ -134,8 +135,10 @@ public class ArmModelController : MonoBehaviour
         if (_markerPositions.Count >= 3)
         {
             _allLostTimer = 0f;
+
             if (!_initialized)
             {
+                // First detection — identify joints from scratch
                 IdentifyByHeadset(_markerPositions);
                 for (int j = 0; j < 3; j++)
                 {
@@ -143,6 +146,32 @@ public class ArmModelController : MonoBehaviour
                     _jointLastSeen[j] = now;
                 }
                 _initialized = true;
+                _markersLost = false;
+            }
+            else if (_markersLost)
+            {
+                // Recovering from loss
+                float lostDuration = now - _lostSince;
+                if (lostDuration > 0.3f)
+                {
+                    // Long loss (>300ms): markers may have moved significantly,
+                    // re-identify from scratch and snap to new positions
+                    IdentifyByHeadset(_markerPositions);
+                    for (int j = 0; j < 3; j++)
+                    {
+                        _jointSmoothed[j] = _jointTargets[j];
+                        _jointLastSeen[j] = now;
+                    }
+                }
+                else
+                {
+                    // Brief flicker: continue tracking normally, let
+                    // smoothing absorb any small jump
+                    MatchMarkersToJoints(_markerPositions, now);
+                    for (int j = 0; j < 3; j++)
+                        _jointLastSeen[j] = now;
+                }
+                _markersLost = false;
             }
             else
             {
@@ -151,14 +180,20 @@ public class ArmModelController : MonoBehaviour
                     _jointLastSeen[j] = now;
             }
         }
-        else if (_markerPositions.Count > 0 && _initialized)
-        {
-            _allLostTimer = 0f;
-            MatchMarkersToJoints(_markerPositions, now);
-        }
         else if (_initialized)
         {
-            _allLostTimer += Time.deltaTime;
+            // Fewer than 3 markers — freeze arm at last good position
+            if (!_markersLost)
+            {
+                _markersLost = true;
+                _lostSince = now;
+            }
+
+            if (_markerPositions.Count == 0)
+                _allLostTimer += Time.deltaTime;
+            else
+                _allLostTimer = 0f;
+
             if (_allLostTimer > markerLossTimeout)
             {
                 SetVisualsActive(false);
@@ -275,6 +310,8 @@ public class ArmModelController : MonoBehaviour
 
             armModeActive = true;
             _initialized  = false;
+            _markersLost  = false;
+            _lostSince    = 0f;
             _allLostTimer = 0f;
             Debug.Log("[Arm] ON — place 3 markers on shoulder, elbow, hand.");
         }
@@ -294,6 +331,7 @@ public class ArmModelController : MonoBehaviour
     {
         _modelInstance = Instantiate(armModelPrefab, transform);
         _modelInstance.name = "ArmModel_YBot";
+        _modelInstance.transform.localScale = Vector3.one * modelScale;
 
         // Disable Animator so we drive bones manually
         var anim = _modelInstance.GetComponent<Animator>();
@@ -330,45 +368,44 @@ public class ArmModelController : MonoBehaviour
         _forearmBindLocalRot   = _forearmBone.localRotation;
 
         HideNonArmParts();
-        ApplySkinColor();
 
         return true;
     }
 
     private void HideNonArmParts()
     {
-        // Build set of bones to KEEP (right arm chain + spine chain to root)
+        // Reparent the upper arm bone (RightArm) directly under model root.
+        // This detaches it from the spine/clavicle chain so we can collapse
+        // everything else — including RightShoulder (clavicle), which was
+        // causing a visible bone sticking toward the torso.
+        _upperArmBone.SetParent(_modelInstance.transform, true);
+
+        // Only keep RightArm and its children (forearm, hand, fingers)
         HashSet<Transform> keep = new HashSet<Transform>();
+        AddSubtree(_upperArmBone, keep);
 
-        // Find RightShoulder (parent of RightArm) and keep its entire subtree
-        Transform rShoulder = _upperArmBone.parent;
-        if (rShoulder != null)
-            AddSubtree(rShoulder, keep);
-
-        // Keep spine chain from RightShoulder up to model root
-        Transform t = rShoulder;
-        while (t != null && t != _modelInstance.transform)
-        {
-            keep.Add(t);
-            t = t.parent;
-        }
-
-        // Scale every skeleton bone NOT in the keep set to zero
+        // Scale every other skeleton bone to zero — collapses torso,
+        // clavicle, head, legs, left arm into invisible points
         foreach (var bone in _modelInstance.GetComponentsInChildren<Transform>())
         {
             if (bone == _modelInstance.transform) continue;
             if (keep.Contains(bone)) continue;
             if (bone.GetComponent<SkinnedMeshRenderer>() != null) continue;
             if (bone.GetComponent<MeshRenderer>() != null) continue;
-
-            // Only collapse actual skeleton bones (not root-level objects)
-            if (bone.parent != _modelInstance.transform)
-                bone.localScale = Vector3.zero;
+            bone.localScale = Vector3.zero;
         }
 
-        // Disable shadow casting (shadow of hidden torso would look odd)
         foreach (var r in _modelInstance.GetComponentsInChildren<Renderer>())
             r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+
+        // Prevent SkinnedMeshRenderer from culling the arm when its static
+        // bounds don't match the runtime bone positions (reparenting the
+        // upper-arm bone invalidates the original bounds).
+        foreach (var smr in _modelInstance.GetComponentsInChildren<SkinnedMeshRenderer>())
+        {
+            smr.updateWhenOffscreen = true;
+            smr.forceMatrixRecalculationPerRender = true;
+        }
     }
 
     private void AddSubtree(Transform root, HashSet<Transform> set)
@@ -376,23 +413,6 @@ public class ArmModelController : MonoBehaviour
         set.Add(root);
         for (int i = 0; i < root.childCount; i++)
             AddSubtree(root.GetChild(i), set);
-    }
-
-    private void ApplySkinColor()
-    {
-        foreach (var r in _modelInstance.GetComponentsInChildren<Renderer>())
-        {
-            // Instantiate materials so we don't modify the shared asset
-            Material[] mats = r.materials; // this already returns instances
-            foreach (var mat in mats)
-            {
-                if (mat.HasProperty("_BaseColor"))
-                    mat.SetColor("_BaseColor", skinColor);
-                if (mat.HasProperty("_Color"))
-                    mat.color = skinColor;
-            }
-            r.materials = mats;
-        }
     }
 
     private void UpdateRiggedModel()
@@ -570,21 +590,16 @@ public class ArmModelController : MonoBehaviour
             string[] jn = { "Shoulder", "Elbow", "Hand" };
             float now = Time.time;
 
-            if (visibleMarkers == 3)
+            if (visibleMarkers >= 3 && !_markersLost)
             {
                 style.normal.textColor = Color.green;
                 GUI.Label(new Rect(10, y, 500, 25), "ARM: 3/3 tracked", style);
             }
-            else if (_initialized && (visibleMarkers > 0 || _allLostTimer <= markerLossTimeout))
+            else if (_initialized && _markersLost && _allLostTimer <= markerLossTimeout)
             {
-                string s = "";
-                for (int j = 0; j < 3; j++)
-                {
-                    float age = now - _jointLastSeen[j];
-                    s += age < 0.15f ? $" {jn[j]}:OK" : $" {jn[j]}:HELD";
-                }
                 style.normal.textColor = Color.yellow;
-                GUI.Label(new Rect(10, y, 600, 25), $"ARM: {visibleMarkers}/3 |{s}", style);
+                GUI.Label(new Rect(10, y, 600, 25),
+                    $"ARM: FROZEN ({visibleMarkers}/3) — waiting for 3 markers", style);
             }
             else
             {
