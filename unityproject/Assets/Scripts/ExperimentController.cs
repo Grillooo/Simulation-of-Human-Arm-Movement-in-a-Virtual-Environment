@@ -1,0 +1,530 @@
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+/// <summary>
+/// Neuroscience experiment module — Approach B (interleaved).
+///
+/// Flow:
+///   1. Press B after arm mode is active (O). Score starts at 0.
+///   2. Hand must be inside the green REST ZONE to arm the next trial.
+///   3. Trial picks type randomly (sound vs silent) by <see cref="silentProbability"/>.
+///      - SOUND trial:
+///          * Spawn red cross, wait preCueDelay (1s), play start.mp3.
+///          * User has hitTimeout (2s) to move hand within detectionRadius.
+///              hit  → +1 point, itempicker.mp3
+///              miss → 0 points, wrong.mp3
+///      - SILENT trial:
+///          * Spawn red cross, wait preCueDelay, DO NOT play start.mp3.
+///          * Observe hand for silentWindow (2s):
+///              stays within stillnessThreshold of spawn position → +1 point
+///              moves more than threshold                         → 0 points, wrong.mp3
+///   4. After each trial the user must return hand to rest zone to start next.
+///   5. After <random(minTrials, maxTrials)> trials, experiment ends.
+///
+/// Per-frame data is logged to Positions/experiment_&lt;timestamp&gt;.csv.
+/// </summary>
+public class ExperimentController : MonoBehaviour
+{
+    // ────────────────────────────────────────────────────────────────
+    //  Inspector
+    // ────────────────────────────────────────────────────────────────
+
+    [Header("References")]
+    public ArmModelController arm;
+    public UDPMarkerReceiver  receiver;
+
+    [Header("Audio Clips")]
+    public AudioClip startClip;        // cue to move  (sound trial)
+    public AudioClip itempickerClip;   // successful hit / correct still
+    public AudioClip wrongClip;        // miss / moved during silent trial
+
+    [Header("Experiment Parameters")]
+    public Key   activateKey       = Key.B;
+    public int   minTrials         = 30;
+    public int   maxTrials         = 50;
+    public float preCueDelay       = 1.0f;   // cross visible → start.mp3 (or silent begin)
+    public float hitTimeout        = 2.0f;   // sound: time allowed to reach cross
+    public float silentWindow      = 2.0f;   // silent: observation window
+    public float postTrialDelay    = 1.0f;   // brief pause showing result
+    public float detectionRadius   = 0.10f;  // hand-to-cross contact (10 cm)
+    public float crossSize         = 0.09f;
+    [Range(0f, 1f)]
+    public float silentProbability = 0.30f;  // chance a trial is silent
+    public float stillnessThreshold = 0.05f; // 5 cm allowed hand drift during silent trial
+    public float firstTrialDelay    = 1.5f;  // grace period after elbow enters rest zone before first cross
+    public float minCrossDistFromRest = 0.25f; // min XZ distance between cross and rest-zone center
+
+    [Header("Cross Spawn Area")]
+    [Tooltip("Cross is spawned at random X ∈ [xMin,xMax], Z ∈ [zMin,zMax], Y = tableSurfaceY.")]
+    public float xMin = -0.55f;
+    public float xMax =  0.55f;
+    public float zMin =  0.55f;   // keep crosses away from the rest zone
+    public float zMax =  0.95f;
+    public float tableSurfaceY = 1.155f;
+
+    [Header("Rest Zone (green rectangle, closest to user)")]
+    public Vector3 restZoneCenter = new Vector3(0f, 1.155f, 0.42f);
+    public Vector2 restZoneSize   = new Vector2(0.30f, 0.12f);  // X, Z extents
+    public float   restYTolerance = 0.15f;                        // hand-height tolerance
+
+    [Header("Output")]
+    public string logFolder = "Positions";
+
+    // ────────────────────────────────────────────────────────────────
+    //  State
+    // ────────────────────────────────────────────────────────────────
+
+    private enum Phase { Idle, WaitingForRest, PreCue, ActiveTrial, PostTrial, Done }
+
+    private Phase   _phase       = Phase.Idle;
+    private int     _trialIndex  = -1;
+    private int     _trialTarget = 0;
+    private int     _score       = 0;
+    private float   _phaseTimer  = 0f;
+    private float   _trialStart  = 0f;
+    private bool    _silentTrial = false;
+    private bool    _trialScored = false;
+    private Vector3 _handAtSpawn;      // hand position when cross appeared (silent trial / precue baseline)
+    private float   _maxDrift    = 0f; // max deviation during silent window
+    private Vector3 _handAtPreCue;     // hand position at start of PreCue (sound trial early-move check)
+    private float   _firstTrialHold  = 0f; // countdown while elbow is in rest zone before first trial
+
+    private GameObject  _crossGO;
+    private Vector3     _crossPos;
+    private GameObject  _restZoneGO;
+    private AudioSource _audio;
+    private Transform   _headset;
+
+
+    private Vector3 _lastHandPos;
+    private float   _lastHandTime;
+    private Vector3 _handVelocity;
+
+    private StreamWriter _csv;
+    private string       _csvPath;
+
+    // ────────────────────────────────────────────────────────────────
+    //  Unity lifecycle
+    // ────────────────────────────────────────────────────────────────
+
+    void Awake()
+    {
+        if (arm == null)      arm      = FindAnyObjectByType<ArmModelController>();
+        if (receiver == null) receiver = FindAnyObjectByType<UDPMarkerReceiver>();
+
+        _audio = gameObject.AddComponent<AudioSource>();
+        _audio.spatialBlend = 0f;
+        _audio.playOnAwake  = false;
+
+        var cam = Camera.main;
+        if (cam != null) _headset = cam.transform;
+    }
+
+    void Update()
+    {
+        if (_phase == Phase.Idle
+            && Keyboard.current != null
+            && Keyboard.current[activateKey].wasPressedThisFrame)
+        {
+            if (arm == null || !arm.IsArmModeActive)
+            {
+                Debug.LogWarning("[Exp] Activate arm mode (O) before starting experiment (B).");
+                return;
+            }
+            BeginExperiment();
+            return;
+        }
+
+        if (_phase == Phase.Idle || _phase == Phase.Done) return;
+
+        UpdateHandKinematics();
+        LogFrame();
+
+        switch (_phase)
+        {
+            case Phase.WaitingForRest:
+                if (HandInRestZone())
+                {
+                    if (_trialIndex == 0)
+                    {
+                        _firstTrialHold -= Time.deltaTime;
+                        if (_firstTrialHold <= 0f) StartNextTrial();
+                    }
+                    else
+                    {
+                        StartNextTrial();
+                    }
+                }
+                else
+                {
+                    _firstTrialHold = firstTrialDelay;  // reset if elbow leaves
+                }
+                break;
+
+            case Phase.PreCue:
+                _phaseTimer -= Time.deltaTime;
+                // Early-move penalty: if user moves hand before the cue (or before silent-window start),
+                // it counts as a mistake. Applies to both sound and silent trials.
+                if (arm != null && arm.IsTracking
+                    && Vector3.Distance(arm.HandPositionUnity, _handAtPreCue) > stillnessThreshold)
+                {
+                    Play(wrongClip);
+                    FinishTrial(false);
+                    break;
+                }
+                if (_phaseTimer <= 0f) BeginActivePhase();
+                break;
+
+            case Phase.ActiveTrial:
+                _phaseTimer -= Time.deltaTime;
+                if (_silentTrial)
+                {
+                    TrackSilentDrift();
+                    if (_phaseTimer <= 0f) EndSilentTrial();
+                }
+                else
+                {
+                    if (HandInsideCross())      { EndSoundTrial(true);  }
+                    else if (_phaseTimer <= 0f) { EndSoundTrial(false); }
+                }
+                break;
+
+            case Phase.PostTrial:
+                _phaseTimer -= Time.deltaTime;
+                if (_phaseTimer <= 0f)
+                {
+                    _trialIndex++;
+                    if (_trialIndex >= _trialTarget) EndExperiment();
+                    else _phase = Phase.WaitingForRest;
+                }
+                break;
+        }
+    }
+
+    void OnDestroy() { CloseCSV(); DestroyRestZone(); }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Experiment flow
+    // ────────────────────────────────────────────────────────────────
+
+    private void BeginExperiment()
+    {
+        _trialTarget = Random.Range(minTrials, maxTrials + 1);
+        _trialIndex  = 0;
+        _score       = 0;
+        OpenCSV();
+        SpawnRestZone();
+        _firstTrialHold = firstTrialDelay;
+        Debug.Log($"[Exp] Started. Target trials: {_trialTarget}. Log: {_csvPath}");
+        _phase = Phase.WaitingForRest;
+    }
+
+    private void StartNextTrial()
+    {
+        _silentTrial = Random.value < silentProbability;
+        _crossPos    = RandomCrossPosition();
+        _crossGO     = SpawnCross(_crossPos);
+        _trialStart  = Time.time;
+        _trialScored = false;
+        _maxDrift    = 0f;
+        _handAtPreCue = (arm != null && arm.IsTracking) ? arm.HandPositionUnity : Vector3.zero;
+        _phase       = Phase.PreCue;
+        _phaseTimer  = preCueDelay;
+
+        Debug.Log($"[Exp] Trial {_trialIndex + 1}/{_trialTarget}  " +
+                  $"pos=({_crossPos.x:F2},{_crossPos.y:F2},{_crossPos.z:F2})  " +
+                  $"silent={_silentTrial}");
+    }
+
+    private void BeginActivePhase()
+    {
+        if (_silentTrial)
+        {
+            _handAtSpawn = arm.IsTracking ? arm.HandPositionUnity : Vector3.zero;
+            _phaseTimer  = silentWindow;
+        }
+        else
+        {
+            Play(startClip);
+            _phaseTimer = hitTimeout;
+        }
+        _phase = Phase.ActiveTrial;
+    }
+
+    private void EndSoundTrial(bool hit)
+    {
+        if (hit) { Play(itempickerClip); _score++; }
+        else     { Play(wrongClip); }
+        FinishTrial(hit);
+    }
+
+    private void EndSilentTrial()
+    {
+        bool stayedStill = _maxDrift <= stillnessThreshold;
+        if (stayedStill) { Play(itempickerClip); _score++; }
+        else             { Play(wrongClip); }
+        FinishTrial(stayedStill);
+    }
+
+    private void FinishTrial(bool success)
+    {
+        _trialScored = true;
+        DestroyCross();
+        _phase      = Phase.PostTrial;
+        _phaseTimer = postTrialDelay;
+    }
+
+    private void EndExperiment()
+    {
+        _phase = Phase.Done;
+        DestroyRestZone();
+        CloseCSV();
+        Debug.Log($"[Exp] Finished. CSV: {_csvPath}");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Silent-trial drift tracking
+    // ────────────────────────────────────────────────────────────────
+
+    private void TrackSilentDrift()
+    {
+        if (arm == null || !arm.IsTracking) return;
+        float d = Vector3.Distance(arm.HandPositionUnity, _handAtSpawn);
+        if (d > _maxDrift) _maxDrift = d;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Rest zone
+    // ────────────────────────────────────────────────────────────────
+
+    private void SpawnRestZone()
+    {
+        if (_restZoneGO != null) return;
+        _restZoneGO = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        _restZoneGO.name = "ExperimentRestZone";
+        Destroy(_restZoneGO.GetComponent<Collider>());
+        _restZoneGO.transform.position   = restZoneCenter;
+        _restZoneGO.transform.localScale = new Vector3(restZoneSize.x, 0.004f, restZoneSize.y);
+
+        Shader sh = Shader.Find("Universal Render Pipeline/Unlit");
+        if (sh == null) sh = Shader.Find("Unlit/Color");
+        Material mat = new Material(sh);
+        Color green = new Color(0.2f, 0.85f, 0.3f, 1f);
+        if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", green);
+        mat.color = green;
+        _restZoneGO.GetComponent<Renderer>().material = mat;
+    }
+
+    private void DestroyRestZone()
+    {
+        if (_restZoneGO != null) Destroy(_restZoneGO);
+        _restZoneGO = null;
+    }
+
+    private bool HandInRestZone()
+    {
+        // Rest zone is judged by the ELBOW marker — the elbow is the stable pivot
+        // that actually returns to the rest pose, while the hand can drift slightly.
+        if (arm == null || !arm.IsTracking) return false;
+        Vector3 e = arm.ElbowPositionUnity;
+        Vector3 c = restZoneCenter;
+        return Mathf.Abs(e.x - c.x) <= restZoneSize.x * 0.5f
+            && Mathf.Abs(e.z - c.z) <= restZoneSize.y * 0.5f
+            && Mathf.Abs(e.y - c.y) <= restYTolerance;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Cross spawn & detection
+    // ────────────────────────────────────────────────────────────────
+
+    private Vector3 RandomCrossPosition()
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            Vector3 p = new Vector3(
+                Random.Range(xMin, xMax),
+                tableSurfaceY,
+                Random.Range(zMin, zMax));
+            float dx = p.x - restZoneCenter.x;
+            float dz = p.z - restZoneCenter.z;
+            if (Mathf.Sqrt(dx * dx + dz * dz) >= minCrossDistFromRest) return p;
+        }
+        // fallback: push Z forward to guarantee distance
+        return new Vector3(
+            Random.Range(xMin, xMax),
+            tableSurfaceY,
+            Mathf.Max(zMin, restZoneCenter.z + minCrossDistFromRest));
+    }
+
+    private GameObject SpawnCross(Vector3 position)
+    {
+        GameObject cross = new GameObject("ExperimentCross");
+        cross.transform.position = position;
+
+        Shader sh = Shader.Find("Universal Render Pipeline/Unlit");
+        if (sh == null) sh = Shader.Find("Unlit/Color");
+        Material mat = new Material(sh);
+        if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", Color.red);
+        mat.color = Color.red;
+
+        float bar   = crossSize;
+        float thick = crossSize * 0.18f;
+
+        GameObject h = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        h.name = "bar_h";
+        h.transform.SetParent(cross.transform, false);
+        h.transform.localScale = new Vector3(bar, thick, thick);
+        Destroy(h.GetComponent<Collider>());
+        h.GetComponent<Renderer>().material = mat;
+
+        GameObject v = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        v.name = "bar_v";
+        v.transform.SetParent(cross.transform, false);
+        v.transform.localScale = new Vector3(thick, thick, bar);
+        Destroy(v.GetComponent<Collider>());
+        v.GetComponent<Renderer>().material = mat;
+
+        return cross;
+    }
+
+    private void DestroyCross()
+    {
+        if (_crossGO != null) Destroy(_crossGO);
+        _crossGO = null;
+    }
+
+    private bool HandInsideCross()
+    {
+        if (arm == null || !arm.IsTracking) return false;
+        return Vector3.Distance(arm.HandPositionUnity, _crossPos) < detectionRadius;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Kinematics
+    // ────────────────────────────────────────────────────────────────
+
+    private void UpdateHandKinematics()
+    {
+        if (arm == null || !arm.IsTracking) return;
+        Vector3 p  = arm.HandPositionUnity;
+        float   t  = Time.time;
+        float   dt = Mathf.Max(t - _lastHandTime, 1e-4f);
+        Vector3 v  = (p - _lastHandPos) / dt;
+        _handVelocity = Vector3.Lerp(_handVelocity, v, 0.5f);
+        _lastHandPos  = p;
+        _lastHandTime = t;
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Audio
+    // ────────────────────────────────────────────────────────────────
+
+    private void Play(AudioClip c)
+    {
+        if (c == null) return;
+        _audio.PlayOneShot(c);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  CSV logging
+    // ────────────────────────────────────────────────────────────────
+
+    private void OpenCSV()
+    {
+        string dir = Path.Combine(Application.dataPath, "..", logFolder);
+        if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+        string stamp = System.DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        _csvPath = Path.Combine(dir, $"experiment_{stamp}.csv");
+        _csv = new StreamWriter(_csvPath, false);
+        _csv.WriteLine(
+            "timestamp,trial,phase,silent,scored,score," +
+            "cross_x,cross_y,cross_z," +
+            "hand_unity_x,hand_unity_y,hand_unity_z," +
+            "hand_raw_x,hand_raw_y,hand_raw_z," +
+            "vel_x,vel_y,vel_z," +
+            "head_pos_x,head_pos_y,head_pos_z," +
+            "head_rot_x,head_rot_y,head_rot_z,head_rot_w");
+        _csv.Flush();
+    }
+
+    private void LogFrame()
+    {
+        if (_csv == null || arm == null) return;
+        Vector3 handU = arm.IsTracking ? arm.HandPositionUnity : Vector3.zero;
+        Vector3 handR = GetHandRaw();
+        Vector3 hp    = _headset != null ? _headset.position : Vector3.zero;
+        Quaternion hr = _headset != null ? _headset.rotation : Quaternion.identity;
+        var ci = CultureInfo.InvariantCulture;
+        _csv.WriteLine(string.Format(ci,
+            "{0:F4},{1},{2},{3},{4},{5}," +
+            "{6:F4},{7:F4},{8:F4}," +
+            "{9:F4},{10:F4},{11:F4}," +
+            "{12:F4},{13:F4},{14:F4}," +
+            "{15:F4},{16:F4},{17:F4}," +
+            "{18:F4},{19:F4},{20:F4}," +
+            "{21:F4},{22:F4},{23:F4},{24:F4}",
+            Time.time - _trialStart, _trialIndex, _phase,
+            _silentTrial ? 1 : 0, _trialScored ? 1 : 0, _score,
+            _crossPos.x, _crossPos.y, _crossPos.z,
+            handU.x, handU.y, handU.z,
+            handR.x, handR.y, handR.z,
+            _handVelocity.x, _handVelocity.y, _handVelocity.z,
+            hp.x, hp.y, hp.z,
+            hr.x, hr.y, hr.z, hr.w));
+    }
+
+    private Vector3 GetHandRaw()
+    {
+        if (receiver == null) return Vector3.zero;
+        Dictionary<int, Vector3> raws = receiver.GetAllRawPositions();
+        foreach (var kv in raws) return kv.Value;
+        return Vector3.zero;
+    }
+
+    private void CloseCSV()
+    {
+        if (_csv != null) { _csv.Flush(); _csv.Close(); _csv = null; }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  HUD
+    // ────────────────────────────────────────────────────────────────
+
+    void OnGUI()
+    {
+        GUIStyle s = new GUIStyle(GUI.skin.label) { fontSize = 13, fontStyle = FontStyle.Bold };
+        s.normal.textColor = Color.cyan;
+        float y = Screen.height - 55f;
+
+        switch (_phase)
+        {
+            case Phase.Idle:
+                if (arm != null && arm.IsArmModeActive)
+                    GUI.Label(new Rect(10, y, 700, 20), "Press B to start experiment.", s);
+                break;
+            case Phase.WaitingForRest:
+                s.normal.textColor = Color.yellow;
+                GUI.Label(new Rect(10, y, 700, 20),
+                    $"EXP {_trialIndex + 1}/{_trialTarget}  —  place hand in GREEN zone", s);
+                break;
+            case Phase.PreCue:
+            case Phase.ActiveTrial:
+                string tag = _silentTrial ? "SILENT" : "SOUND";
+                GUI.Label(new Rect(10, y, 700, 20),
+                    $"EXP {_trialIndex + 1}/{_trialTarget}  [{tag}]  phase={_phase}", s);
+                break;
+            case Phase.PostTrial:
+                GUI.Label(new Rect(10, y, 700, 20),
+                    $"Trial {_trialIndex + 1}/{_trialTarget} complete", s);
+                break;
+            case Phase.Done:
+                s.normal.textColor = Color.green;
+                GUI.Label(new Rect(10, y, 700, 20),
+                    $"Experiment complete.", s);
+                break;
+        }
+    }
+}

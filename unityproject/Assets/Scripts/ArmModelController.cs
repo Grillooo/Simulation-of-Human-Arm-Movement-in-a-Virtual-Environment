@@ -45,6 +45,10 @@ public class ArmModelController : MonoBehaviour
     [SerializeField] private int visibleMarkers = 0;
 
     public bool IsArmModeActive => armModeActive;
+    public bool IsTracking => armModeActive && _initialized;
+    public Vector3 HandPositionUnity     => _jointSmoothed[HAND];
+    public Vector3 ShoulderPositionUnity => _jointSmoothed[SHOULDER];
+    public Vector3 ElbowPositionUnity    => _jointSmoothed[ELBOW];
 
     private const int SHOULDER = 0, ELBOW = 1, HAND = 2;
 
