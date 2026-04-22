@@ -33,8 +33,25 @@ public class ExperimentController : MonoBehaviour
     // ────────────────────────────────────────────────────────────────
 
     [Header("References")]
-    public ArmModelController arm;
-    public UDPMarkerReceiver  receiver;
+    public ArmModelController   arm;
+    public UDPMarkerReceiver    receiver;
+    public ArmPlaybackController playback;
+
+    [Header("Playback Phase")]
+    public int   playbackTrials       = 5;
+    public float playbackRestDelay    = 1.5f;  // wait after elbow returns to rest zone
+    public float playbackPostDelay    = 1.0f;  // pause after each autonomous movement
+
+    [Header("Fine-tuning (pretrain + finetune pipeline)")]
+    [Tooltip("If true, after data collection launches Python to fine-tune the NN on this session's CSV before playback.")]
+    public bool   autoFinetune    = true;
+    [Tooltip("Absolute or PATH-resolvable Python executable. e.g. python, python3, C:/Python311/python.exe")]
+    public string pythonExecutable = "python";
+    [Tooltip("Script path relative to the project root (folder containing Assets/).")]
+    public string trainScriptPath = "../ml/train_trajectory.py";
+    public float  finetuneTimeout = 120f; // seconds
+    [Tooltip("Trial index (1-based) at which background fine-tune is launched in parallel with remaining trials. 0 = disabled (wait until end).")]
+    public int    backgroundFinetuneTriggerTrial = 25;
 
     [Header("Audio Clips")]
     public AudioClip startClip;        // cue to move  (sound trial)
@@ -43,8 +60,8 @@ public class ExperimentController : MonoBehaviour
 
     [Header("Experiment Parameters")]
     public Key   activateKey       = Key.B;
-    public int   minTrials         = 30;
-    public int   maxTrials         = 50;
+    public int   minTrials         = 40;
+    public int   maxTrials         = 60;
     public float preCueDelay       = 1.0f;   // cross visible → start.mp3 (or silent begin)
     public float hitTimeout        = 2.0f;   // sound: time allowed to reach cross
     public float silentWindow      = 2.0f;   // silent: observation window
@@ -77,7 +94,18 @@ public class ExperimentController : MonoBehaviour
     //  State
     // ────────────────────────────────────────────────────────────────
 
-    private enum Phase { Idle, WaitingForRest, PreCue, ActiveTrial, PostTrial, Done }
+    private enum Phase {
+        Idle, WaitingForRest, PreCue, ActiveTrial, PostTrial, Done,
+        WaitingForTraining,
+        PlaybackWaitRest, PlaybackPreCue, PlaybackActive, PlaybackPost, PlaybackDone
+    }
+
+    private int   _playbackIndex  = 0;
+    private float _playbackHold   = 0f;
+    private System.Diagnostics.Process _trainProc;
+    private float _trainTimer     = 0f;
+    private bool  _trainLaunched  = false;
+    private string _snapshotCsvPath;
 
     private Phase   _phase       = Phase.Idle;
     private int     _trialIndex  = -1;
@@ -114,6 +142,7 @@ public class ExperimentController : MonoBehaviour
     {
         if (arm == null)      arm      = FindAnyObjectByType<ArmModelController>();
         if (receiver == null) receiver = FindAnyObjectByType<UDPMarkerReceiver>();
+        if (playback == null) playback = FindAnyObjectByType<ArmPlaybackController>();
 
         _audio = gameObject.AddComponent<AudioSource>();
         _audio.spatialBlend = 0f;
@@ -138,7 +167,10 @@ public class ExperimentController : MonoBehaviour
             return;
         }
 
-        if (_phase == Phase.Idle || _phase == Phase.Done) return;
+        if (_phase == Phase.Idle || _phase == Phase.PlaybackDone) return;
+
+        // While Python is fine-tuning, skip logging (CSV already closed).
+        if (_phase == Phase.WaitingForTraining) { TickFinetune(); return; }
 
         UpdateHandKinematics();
         LogFrame();
@@ -197,8 +229,38 @@ public class ExperimentController : MonoBehaviour
                 if (_phaseTimer <= 0f)
                 {
                     _trialIndex++;
+                    MaybeLaunchBackgroundFinetune();
                     if (_trialIndex >= _trialTarget) EndExperiment();
                     else _phase = Phase.WaitingForRest;
+                }
+                break;
+
+            // ── Autonomous NN playback phase ────────────────────────
+            case Phase.PlaybackWaitRest:
+                if (HandInRestZone())
+                {
+                    _playbackHold -= Time.deltaTime;
+                    if (_playbackHold <= 0f) BeginPlaybackTrial();
+                }
+                else _playbackHold = playbackRestDelay;
+                break;
+
+            case Phase.PlaybackPreCue:
+                _phaseTimer -= Time.deltaTime;
+                if (_phaseTimer <= 0f) StartAutonomousMovement();
+                break;
+
+            case Phase.PlaybackActive:
+                // Driven by ArmPlaybackController; completion callback advances phase.
+                break;
+
+            case Phase.PlaybackPost:
+                _phaseTimer -= Time.deltaTime;
+                if (_phaseTimer <= 0f)
+                {
+                    _playbackIndex++;
+                    if (_playbackIndex >= playbackTrials) EndPlayback();
+                    else _phase = Phase.PlaybackWaitRest;
                 }
                 break;
         }
@@ -218,6 +280,8 @@ public class ExperimentController : MonoBehaviour
         OpenCSV();
         SpawnRestZone();
         _firstTrialHold = firstTrialDelay;
+        _trainLaunched  = false;
+        _snapshotCsvPath = null;
         Debug.Log($"[Exp] Started. Target trials: {_trialTarget}. Log: {_csvPath}");
         _phase = Phase.WaitingForRest;
     }
@@ -279,10 +343,193 @@ public class ExperimentController : MonoBehaviour
 
     private void EndExperiment()
     {
-        _phase = Phase.Done;
+        Debug.Log("[Exp] Data collection complete.");
+        CloseCSV();
+
+        // If background fine-tune was launched mid-experiment, just wait for it.
+        if (_trainLaunched && _trainProc != null)
+        {
+            _phase = Phase.WaitingForTraining;
+            return;
+        }
+
+        if (autoFinetune)
+        {
+            if (LaunchFinetune(_csvPath))
+            {
+                _phase      = Phase.WaitingForTraining;
+                _trainTimer = 0f;
+                _trainLaunched = true;
+                return;
+            }
+            Debug.LogWarning("[Exp] Fine-tune launch failed — skipping.");
+        }
+        EnterPlaybackPhase();
+    }
+
+    private void MaybeLaunchBackgroundFinetune()
+    {
+        if (!autoFinetune) return;
+        if (_trainLaunched) return;
+        if (backgroundFinetuneTriggerTrial <= 0) return;
+        if (_trialIndex < backgroundFinetuneTriggerTrial) return;
+        if (_csv == null || _csvPath == null) return;
+
+        // Flush pending rows so the snapshot has all completed trials.
+        try { _csv.Flush(); } catch { }
+
+        // Copy to a snapshot so Python can read while Unity keeps appending
+        // (avoids Windows file-sharing violations).
+        _snapshotCsvPath = _csvPath.Replace(".csv", "_snapshot.csv");
+        try
+        {
+            File.Copy(_csvPath, _snapshotCsvPath, overwrite: true);
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[Exp] Snapshot copy failed: {e.Message}");
+            return;
+        }
+
+        if (LaunchFinetune(_snapshotCsvPath))
+        {
+            _trainLaunched = true;
+            _trainTimer    = 0f;
+            Debug.Log($"[Exp] Background fine-tune started at trial {_trialIndex} (snapshot: {Path.GetFileName(_snapshotCsvPath)})");
+        }
+    }
+
+    private void EnterPlaybackPhase()
+    {
+        if (playback == null || !playback.IsLoaded)
+        {
+            Debug.LogWarning("[Exp] No playback model loaded — ending without NN phase.");
+            _phase = Phase.PlaybackDone;
+            DestroyRestZone();
+            return;
+        }
+        ReopenCSVAppend();   // resume logging so user reaction is recorded
+        _playbackIndex = 0;
+        _playbackHold  = playbackRestDelay;
+        _phase = Phase.PlaybackWaitRest;
+    }
+
+    private void ReopenCSVAppend()
+    {
+        if (_csv != null || _csvPath == null) return;
+        try { _csv = new StreamWriter(_csvPath, true); }
+        catch (System.Exception e) { Debug.LogWarning($"[Exp] Could not reopen CSV: {e.Message}"); }
+    }
+
+    private bool LaunchFinetune(string csvPath)
+    {
+        try
+        {
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            string script = Path.GetFullPath(Path.Combine(projectRoot, trainScriptPath));
+            if (!File.Exists(script))
+            {
+                Debug.LogError($"[Exp] Train script not found: {script}");
+                return false;
+            }
+            if (csvPath == null || !File.Exists(csvPath))
+            {
+                Debug.LogError($"[Exp] CSV missing: {csvPath}");
+                return false;
+            }
+
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName         = pythonExecutable,
+                Arguments        = $"\"{script}\" --finetune \"{csvPath}\"",
+                WorkingDirectory = Path.GetDirectoryName(script),
+                UseShellExecute  = false,
+                CreateNoWindow   = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError  = true,
+            };
+            _trainProc = System.Diagnostics.Process.Start(psi);
+            Debug.Log($"[Exp] Fine-tune launched: {pythonExecutable} {psi.Arguments}");
+            return _trainProc != null;
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[Exp] Launch error: {e.Message}");
+            return false;
+        }
+    }
+
+    private void TickFinetune()
+    {
+        _trainTimer += Time.deltaTime;
+
+        if (_trainProc != null && _trainProc.HasExited)
+        {
+            int code = _trainProc.ExitCode;
+            string stdout = _trainProc.StandardOutput.ReadToEnd();
+            string stderr = _trainProc.StandardError.ReadToEnd();
+            _trainProc.Dispose();
+            _trainProc = null;
+
+            if (code != 0)
+            {
+                Debug.LogError($"[Exp] Fine-tune failed (exit {code}).\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+                EnterPlaybackPhase();   // fall back to whatever JSON exists
+                return;
+            }
+            Debug.Log("[Exp] Fine-tune OK. Reloading model.\n" + stdout);
+
+            if (playback != null) playback.Reload();
+            if (_snapshotCsvPath != null && File.Exists(_snapshotCsvPath))
+            {
+                try { File.Delete(_snapshotCsvPath); } catch { }
+            }
+            EnterPlaybackPhase();
+            return;
+        }
+
+        if (_trainTimer > finetuneTimeout)
+        {
+            Debug.LogError("[Exp] Fine-tune timeout — proceeding with existing model.");
+            try { _trainProc?.Kill(); } catch { }
+            _trainProc?.Dispose();
+            _trainProc = null;
+            EnterPlaybackPhase();
+        }
+    }
+
+    private void BeginPlaybackTrial()
+    {
+        _crossPos    = RandomCrossPosition();
+        _crossGO     = SpawnCross(_crossPos);
+        _silentTrial = false;
+        _trialStart  = Time.time;
+        _phase       = Phase.PlaybackPreCue;
+        _phaseTimer  = preCueDelay;
+        Debug.Log($"[Exp/NN] Playback {_playbackIndex + 1}/{playbackTrials}  pos=({_crossPos.x:F2},{_crossPos.z:F2})");
+    }
+
+    private void StartAutonomousMovement()
+    {
+        // SILENT autonomous movement — no cue sound. We want to observe how
+        // the user reacts to the arm moving when no stimulus told them to.
+        _phase = Phase.PlaybackActive;
+        playback.Play(_crossPos, OnAutonomousMovementDone);
+    }
+
+    private void OnAutonomousMovementDone()
+    {
+        DestroyCross();
+        _phase      = Phase.PlaybackPost;
+        _phaseTimer = playbackPostDelay;
+    }
+
+    private void EndPlayback()
+    {
+        Debug.Log("[Exp/NN] Autonomous playback finished.");
+        _phase = Phase.PlaybackDone;
         DestroyRestZone();
         CloseCSV();
-        Debug.Log($"[Exp] Finished. CSV: {_csvPath}");
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -524,6 +771,31 @@ public class ExperimentController : MonoBehaviour
                 s.normal.textColor = Color.green;
                 GUI.Label(new Rect(10, y, 700, 20),
                     $"Experiment complete.", s);
+                break;
+            case Phase.WaitingForTraining:
+                s.normal.textColor = Color.cyan;
+                GUI.Label(new Rect(10, y, 800, 20),
+                    $"Personalising NN model...  ({_trainTimer:F0}s)", s);
+                break;
+            case Phase.PlaybackWaitRest:
+                s.normal.textColor = Color.magenta;
+                GUI.Label(new Rect(10, y, 800, 20),
+                    $"NN {_playbackIndex + 1}/{playbackTrials}  —  place elbow in GREEN zone and keep still", s);
+                break;
+            case Phase.PlaybackPreCue:
+            case Phase.PlaybackActive:
+                s.normal.textColor = Color.magenta;
+                GUI.Label(new Rect(10, y, 800, 20),
+                    $"NN {_playbackIndex + 1}/{playbackTrials}  —  arm moves autonomously, DO NOT move", s);
+                break;
+            case Phase.PlaybackPost:
+                s.normal.textColor = Color.magenta;
+                GUI.Label(new Rect(10, y, 800, 20),
+                    $"NN trial {_playbackIndex + 1}/{playbackTrials} done", s);
+                break;
+            case Phase.PlaybackDone:
+                s.normal.textColor = Color.green;
+                GUI.Label(new Rect(10, y, 800, 20), "Session complete.", s);
                 break;
         }
     }

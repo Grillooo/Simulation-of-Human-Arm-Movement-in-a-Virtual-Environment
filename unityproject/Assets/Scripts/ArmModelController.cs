@@ -49,6 +49,62 @@ public class ArmModelController : MonoBehaviour
     public Vector3 HandPositionUnity     => _jointSmoothed[HAND];
     public Vector3 ShoulderPositionUnity => _jointSmoothed[SHOULDER];
     public Vector3 ElbowPositionUnity    => _jointSmoothed[ELBOW];
+    public bool IsPlaybackActive => _playbackActive;
+
+    // Playback override (driven by NN) — when active, marker input is ignored
+    // and the hand is moved to the provided position each frame. Elbow is
+    // resolved via simple 2-link IK from the frozen shoulder.
+    private bool    _playbackActive;
+    private Vector3 _playbackShoulder;
+    private float   _playbackUpperArmLen;
+    private float   _playbackForearmLen;
+
+    public void BeginPlayback()
+    {
+        if (!_initialized) return;
+        _playbackShoulder   = _jointSmoothed[SHOULDER];
+        _playbackUpperArmLen = Mathf.Max(0.05f, Vector3.Distance(_jointSmoothed[SHOULDER], _jointSmoothed[ELBOW]));
+        _playbackForearmLen  = Mathf.Max(0.05f, Vector3.Distance(_jointSmoothed[ELBOW],    _jointSmoothed[HAND]));
+        _playbackActive = true;
+    }
+
+    public void EndPlayback()
+    {
+        _playbackActive = false;
+        // Force a fresh marker identification next frame
+        _initialized = false;
+        _markersLost = false;
+    }
+
+    public void SetPlaybackHand(Vector3 handPos)
+    {
+        if (!_playbackActive) return;
+        _jointTargets[SHOULDER] = _playbackShoulder;
+        _jointTargets[HAND]     = handPos;
+        _jointTargets[ELBOW]    = ResolveElbowIK(_playbackShoulder, handPos,
+                                                 _playbackUpperArmLen, _playbackForearmLen);
+    }
+
+    private Vector3 ResolveElbowIK(Vector3 shoulder, Vector3 hand, float l1, float l2)
+    {
+        Vector3 diff = hand - shoulder;
+        float d = diff.magnitude;
+        if (d < 1e-4f) return shoulder + Vector3.down * l1;
+
+        // Clamp so triangle is feasible
+        d = Mathf.Clamp(d, Mathf.Abs(l1 - l2) + 1e-3f, l1 + l2 - 1e-3f);
+        Vector3 axis = diff / d;
+
+        // Cosine rule: distance along axis from shoulder to elbow-projection
+        float a = (l1 * l1 - l2 * l2 + d * d) / (2f * d);
+        float h = Mathf.Sqrt(Mathf.Max(0f, l1 * l1 - a * a));
+
+        // Bend axis: prefer downward deflection (natural elbow)
+        Vector3 bend = Vector3.ProjectOnPlane(Vector3.down, axis).normalized;
+        if (bend.sqrMagnitude < 1e-4f) bend = Vector3.ProjectOnPlane(Vector3.forward, axis).normalized;
+
+        return shoulder + axis * a + bend * h;
+    }
 
     private const int SHOULDER = 0, ELBOW = 1, HAND = 2;
 
@@ -116,6 +172,18 @@ public class ArmModelController : MonoBehaviour
             ToggleArmMode();
 
         if (!armModeActive || _receiver == null || _headset == null) return;
+
+        // ── Playback override: skip marker logic, just smooth + render ──
+        if (_playbackActive)
+        {
+            float tp = smoothSpeed > 0 ? Time.deltaTime * smoothSpeed : 1f;
+            for (int j = 0; j < 3; j++)
+                _jointSmoothed[j] = Vector3.Lerp(_jointSmoothed[j], _jointTargets[j], tp);
+            SetVisualsActive(true);
+            if (_useModel) UpdateRiggedModel(); else UpdatePrimitives();
+            UpdateJointSpheres();
+            return;
+        }
 
         // ── Gather markers, transform to Unity space ────────────────
         Dictionary<int, Vector3> allRaw = _receiver.GetAllRawPositions();

@@ -10,6 +10,7 @@
 
 # Thesis (kept local only)
 /Thesis/
+/ml/wheels
 
 # Claude Code agent and skill configs
 /.claude/
