@@ -1,6 +1,14 @@
 # Simulation of Human Arm Movement in a Virtual Environment
 
-Bachelor's Thesis (TFG) — Bachelor's Degree in Computer Engineering, Universitat de Barcelona.
+<div align="center">
+
+![Python](https://img.shields.io/badge/Python-3.14+-blue?style=flat-square&logo=python&logoColor=white)
+![Unity](https://img.shields.io/badge/Unity-6.3+-green?style=flat-square&logo=unity&logoColor=white)
+![Motive](https://img.shields.io/badge/Motive-2016+-red?style=flat-square)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+**Bachelor's Thesis (TFG) — Bachelor's Degree in Computer Engineering, Universitat de Barcelona.**
+</div>
 
 A Virtual Reality environment built in Unity 6, integrated with an OptiTrack 6-camera optical tracking system, designed to study motor perception and the sense of body ownership. The system renders a first-person virtual arm driven by 3 physical markers (shoulder, elbow, hand) and enables controlled dissociation between real motor execution and visual feedback in VR.
 
